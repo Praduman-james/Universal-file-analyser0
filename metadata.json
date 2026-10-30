@@ -1,0 +1,6 @@
+{
+  "name": "Universal File Analyzer",
+  "description": "Upload, inspect, preview, and chat with any video, image, dataset, code, or document using Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
