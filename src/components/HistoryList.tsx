@@ -1,22 +1,6 @@
-import React, { useState } from "react";
-import { UploadedFile, Folder } from "../types";
-import {
-  FileText,
-  Image,
-  Video,
-  Trash2,
-  Clock,
-  CheckCircle,
-  Folder as FolderIcon,
-  Plus,
-  Star,
-  Edit2,
-  Check,
-  Search,
-  Tag,
-  ArrowRight,
-  ShieldCheck,
-} from "lucide-react";
+import React from "react";
+import { UploadedFile } from "../types";
+import { FileText, Image as ImageIcon, Video, Trash2, Clock, CheckCircle, FileSpreadsheet } from "lucide-react";
 
 interface HistoryListProps {
   files: UploadedFile[];
@@ -24,22 +8,7 @@ interface HistoryListProps {
   onSelectFile: (id: string) => void;
   onDeleteFile: (id: string) => void;
   onClearAll: () => void;
-  onRenameFile: (id: string, newName: string) => void;
-  onMoveFile: (id: string, folderId: string) => void;
-  onToggleFavorite: (id: string) => void;
-  onAddTag: (id: string, tag: string) => void;
 }
-
-const DEFAULT_FOLDERS: Folder[] = [
-  { id: "all", name: "All Documents" },
-  { id: "contracts", name: "Contracts" },
-  { id: "invoices", name: "Invoices & Bills" },
-  { id: "resumes", name: "Resumes & HR" },
-  { id: "legal", name: "Legal Notices" },
-  { id: "media", name: "Media & Scans" },
-];
-
-export type FileTypeFilter = "all" | "documents" | "images" | "videos";
 
 export default function HistoryList({
   files,
@@ -47,23 +16,16 @@ export default function HistoryList({
   onSelectFile,
   onDeleteFile,
   onClearAll,
-  onRenameFile,
-  onMoveFile,
-  onToggleFavorite,
-  onAddTag,
 }: HistoryListProps) {
-  const [selectedTypeFilter, setSelectedTypeFilter] = useState<FileTypeFilter>("all");
-  const [selectedFolderId, setSelectedFolderId] = useState<string>("all");
-  const [searchQuery, setSearchQuery] = useState<string>("");
-  const [editingFileId, setEditingFileId] = useState<string | null>(null);
-  const [newNameInput, setNewNameInput] = useState<string>("");
-  const [tagInputFileId, setTagInputFileId] = useState<string | null>(null);
-  const [newTagInput, setNewTagInput] = useState<string>("");
-
-  // Category counts
-  const docCount = files.filter((f) => !f.isImage && !f.isVideo).length;
-  const imageCount = files.filter((f) => f.isImage).length;
-  const videoCount = files.filter((f) => f.isVideo).length;
+  if (files.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center p-6 text-center border border-dashed border-slate-700/80 rounded-xl bg-slate-900/40" id="empty-history">
+        <Clock className="w-8 h-8 text-slate-500 mb-2" />
+        <p className="text-sm font-medium text-slate-400">No upload history</p>
+        <p className="text-xs text-slate-500 mt-1">Uploaded files will appear here for easy switching.</p>
+      </div>
+    );
+  }
 
   const formatSize = (bytes: number) => {
     if (bytes === 0) return "0 Bytes";
@@ -73,408 +35,131 @@ export default function HistoryList({
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
   };
 
-  // Filter files by Type + Folder + Search
-  const filteredFiles = files.filter((f) => {
-    // 1. File Type category filter
-    if (selectedTypeFilter === "documents" && (f.isImage || f.isVideo)) return false;
-    if (selectedTypeFilter === "images" && !f.isImage) return false;
-    if (selectedTypeFilter === "videos" && !f.isVideo) return false;
+  const getFileBadge = (file: UploadedFile) => {
+    const ext = file.name.split(".").pop()?.toUpperCase() || "";
+    const isExcel = file.isExcel || ext === "XLSX" || ext === "XLS" || file.type.includes("spreadsheet");
+    const isPdf = file.isPdf || file.type === "application/pdf" || ext === "PDF";
+    const isJpg = ext === "JPG" || ext === "JPEG" || file.type === "image/jpeg";
+    const isPng = ext === "PNG" || file.type === "image/png";
 
-    // 2. Folder check
-    if (selectedFolderId !== "all") {
-      if (selectedFolderId === "media" && !f.isVideo && !f.isImage) return false;
-      if (selectedFolderId !== "media" && f.folderId !== selectedFolderId) {
-        // heuristic auto-categorize if no explicit folder
-        const ext = f.name.toLowerCase();
-        if (selectedFolderId === "contracts" && !ext.includes("contract") && !ext.includes("agreement")) return false;
-        if (selectedFolderId === "invoices" && !ext.includes("invoice") && !ext.includes("bill") && !ext.includes("receipt")) return false;
-        if (selectedFolderId === "resumes" && !ext.includes("resume") && !ext.includes("cv")) return false;
-        if (selectedFolderId === "legal" && !ext.includes("legal") && !ext.includes("notice")) return false;
-      }
+    if (isExcel) {
+      return {
+        icon: <FileSpreadsheet className="w-4 h-4 text-emerald-400" />,
+        bg: "bg-emerald-500/10",
+        label: "XLSX",
+      };
     }
-
-    // 3. Search check
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      const matchName = f.name.toLowerCase().includes(q);
-      const matchTag = (f.tags || []).some((t) => t.toLowerCase().includes(q));
-      if (!matchName && !matchTag) return false;
+    if (isPdf) {
+      return {
+        icon: <FileText className="w-4 h-4 text-rose-400" />,
+        bg: "bg-rose-500/10",
+        label: "PDF",
+      };
     }
-
-    return true;
-  });
-
-  const handleStartRename = (file: UploadedFile, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setEditingFileId(file.id);
-    setNewNameInput(file.name);
-  };
-
-  const handleSaveRename = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (newNameInput.trim()) {
-      onRenameFile(id, newNameInput.trim());
+    if (isJpg) {
+      return {
+        icon: <ImageIcon className="w-4 h-4 text-amber-400" />,
+        bg: "bg-amber-500/10",
+        label: "JPG",
+      };
     }
-    setEditingFileId(null);
-  };
-
-  const handleAddTagSubmit = (id: string, e: React.KeyboardEvent | React.MouseEvent) => {
-    e.stopPropagation();
-    if (newTagInput.trim()) {
-      onAddTag(id, newTagInput.trim());
-      setNewTagInput("");
-      setTagInputFileId(null);
+    if (isPng) {
+      return {
+        icon: <ImageIcon className="w-4 h-4 text-cyan-400" />,
+        bg: "bg-cyan-500/10",
+        label: "PNG",
+      };
     }
+    if (file.isImage) {
+      return {
+        icon: <ImageIcon className="w-4 h-4 text-emerald-400" />,
+        bg: "bg-emerald-500/10",
+        label: "IMG",
+      };
+    }
+    if (file.isVideo) {
+      return {
+        icon: <Video className="w-4 h-4 text-cyan-400" />,
+        bg: "bg-cyan-500/10",
+        label: "VID",
+      };
+    }
+    return {
+      icon: <FileText className="w-4 h-4 text-slate-400" />,
+      bg: "bg-slate-800",
+      label: ext || "TXT",
+    };
   };
 
   return (
-    <div className="flex flex-col h-full space-y-3" id="history-container">
-      {/* Top Header */}
-      <div className="flex items-center justify-between">
+    <div className="flex flex-col h-full" id="history-container">
+      <div className="flex items-center justify-between mb-3">
         <h3 className="text-xs font-semibold text-slate-300 tracking-wider uppercase flex items-center gap-1.5 font-mono">
-          <FolderIcon className="w-3.5 h-3.5 text-emerald-500" /> Workspace Files ({files.length})
+          <Clock className="w-3.5 h-3.5 text-emerald-500" /> Files ({files.length})
         </h3>
-        {files.length > 0 && (
-          <button
-            type="button"
-            onClick={onClearAll}
-            className="text-[11px] text-red-400 hover:text-red-300 transition-colors cursor-pointer hover:underline flex items-center gap-1 font-medium bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 px-2 py-0.5 rounded-lg"
-            id="btn-clear-history"
-            title="Clear workspace or history files"
-          >
-            <Trash2 className="w-3 h-3 text-red-400" />
-            <span>Clear</span>
-          </button>
-        )}
-      </div>
-
-      {/* Search Bar */}
-      <div className="relative">
-        <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="Filter files or tags..."
-          className="w-full bg-slate-950 border border-slate-800 text-slate-200 text-xs rounded-xl pl-8 pr-3 py-1.5 focus:outline-none focus:border-emerald-500/50"
-        />
-      </div>
-
-      {/* File Type Filter Tabs */}
-      <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950/90 border border-slate-800/80 rounded-xl">
         <button
-          type="button"
-          onClick={() => setSelectedTypeFilter("all")}
-          className={`flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-            selectedTypeFilter === "all"
-              ? "bg-slate-800 text-slate-100 shadow-sm border border-slate-700 font-semibold"
-              : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"
-          }`}
-          title="Show all files"
+          onClick={onClearAll}
+          className="text-xs text-red-400 hover:text-red-300 transition-colors flex items-center gap-1 hover:underline cursor-pointer"
+          id="btn-clear-history"
         >
-          <span>All</span>
-          <span
-            className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono leading-none ${
-              selectedTypeFilter === "all"
-                ? "bg-slate-700 text-slate-200"
-                : "bg-slate-900 text-slate-500"
-            }`}
-          >
-            {files.length}
-          </span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSelectedTypeFilter("documents")}
-          className={`flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-            selectedTypeFilter === "documents"
-              ? "bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 font-semibold shadow-sm"
-              : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"
-          }`}
-          title="Show Documents (PDF, Word, Excel, Text, etc.)"
-        >
-          <FileText className="w-3 h-3 shrink-0" />
-          <span className="truncate">Docs</span>
-          <span
-            className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono leading-none ${
-              selectedTypeFilter === "documents"
-                ? "bg-indigo-500/30 text-indigo-200"
-                : "bg-slate-900 text-slate-500"
-            }`}
-          >
-            {docCount}
-          </span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSelectedTypeFilter("images")}
-          className={`flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-            selectedTypeFilter === "images"
-              ? "bg-amber-500/20 text-amber-300 border border-amber-500/40 font-semibold shadow-sm"
-              : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"
-          }`}
-          title="Show Images (JPG, PNG, WebP)"
-        >
-          <Image className="w-3 h-3 shrink-0" />
-          <span className="truncate">Images</span>
-          <span
-            className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono leading-none ${
-              selectedTypeFilter === "images"
-                ? "bg-amber-500/30 text-amber-200"
-                : "bg-slate-900 text-slate-500"
-            }`}
-          >
-            {imageCount}
-          </span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setSelectedTypeFilter("videos")}
-          className={`flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-            selectedTypeFilter === "videos"
-              ? "bg-rose-500/20 text-rose-300 border border-rose-500/40 font-semibold shadow-sm"
-              : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"
-          }`}
-          title="Show Videos (MP4, WebM)"
-        >
-          <Video className="w-3 h-3 shrink-0" />
-          <span className="truncate">Videos</span>
-          <span
-            className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono leading-none ${
-              selectedTypeFilter === "videos"
-                ? "bg-rose-500/30 text-rose-200"
-                : "bg-slate-900 text-slate-500"
-            }`}
-          >
-            {videoCount}
-          </span>
+          Clear All
         </button>
       </div>
 
-      {/* Folder Chips */}
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none text-[11px]">
-        {DEFAULT_FOLDERS.map((folder) => (
-          <button
-            key={folder.id}
-            type="button"
-            onClick={() => setSelectedFolderId(folder.id)}
-            className={`px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors cursor-pointer ${
-              selectedFolderId === folder.id
-                ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-medium"
-                : "bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200"
-            }`}
-          >
-            {folder.name}
-          </button>
-        ))}
-      </div>
+      <div className="flex-1 overflow-y-auto space-y-2 pr-1 max-h-[300px] lg:max-h-none scrollbar-thin scrollbar-thumb-slate-800" id="history-list">
+        {files.map((file) => {
+          const isActive = file.id === activeFileId;
+          const badge = getFileBadge(file);
 
-      {/* File List */}
-      <div
-        className="flex-1 overflow-y-auto space-y-2 pr-1 max-h-[380px] lg:max-h-none scrollbar-thin scrollbar-thumb-slate-800"
-        id="history-list"
-      >
-        {filteredFiles.length === 0 ? (
-          <div className="text-center py-8 text-xs text-slate-400 bg-slate-950/40 rounded-xl border border-slate-800/60 p-4 space-y-2">
-            <p className="text-slate-400">
-              {selectedTypeFilter !== "all"
-                ? `No ${selectedTypeFilter} found in this category.`
-                : selectedFolderId !== "all"
-                ? `No files in "${DEFAULT_FOLDERS.find((f) => f.id === selectedFolderId)?.name}"`
-                : "No files match your search criteria."}
-            </p>
-            {(selectedTypeFilter !== "all" || selectedFolderId !== "all" || searchQuery.trim()) && (
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedTypeFilter("all");
-                  setSelectedFolderId("all");
-                  setSearchQuery("");
-                }}
-                className="text-[11px] text-emerald-400 hover:text-emerald-300 underline cursor-pointer"
-              >
-                Reset filters & show all
-              </button>
-            )}
-          </div>
-        ) : (
-          filteredFiles.map((file) => {
-            const isActive = file.id === activeFileId;
-            const isEditing = editingFileId === file.id;
-
-            return (
-              <div
-                key={file.id}
-                className={`group relative flex flex-col p-3 rounded-xl transition-all duration-200 border cursor-pointer ${
-                  isActive
-                    ? "bg-slate-800 border-slate-600 shadow-md shadow-emerald-950/20"
-                    : "bg-slate-900/60 border-slate-800 hover:border-slate-700 hover:bg-slate-800/40"
-                }`}
-                onClick={() => onSelectFile(file.id)}
-                id={`history-item-${file.id}`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                    <div
-                      className={`p-1.5 rounded-lg shrink-0 ${
-                        isActive ? "bg-emerald-500/10 text-emerald-400" : "bg-slate-800 text-slate-400"
-                      }`}
-                    >
-                      {file.isVideo ? (
-                        <Video className="w-4 h-4" />
-                      ) : file.isImage ? (
-                        <Image className="w-4 h-4" />
-                      ) : (
-                        <FileText className="w-4 h-4" />
-                      )}
-                    </div>
-
-                    <div className="min-w-0 flex-1">
-                      {isEditing ? (
-                        <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                          <input
-                            type="text"
-                            value={newNameInput}
-                            onChange={(e) => setNewNameInput(e.target.value)}
-                            className="bg-slate-950 border border-emerald-500 text-slate-200 text-xs rounded px-1.5 py-0.5 w-full font-mono"
-                            autoFocus
-                          />
-                          <button
-                            type="button"
-                            onClick={(e) => handleSaveRename(file.id, e)}
-                            className="p-1 text-emerald-400 hover:bg-emerald-500/10 rounded"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      ) : (
-                        <p className="text-xs font-semibold text-slate-200 truncate group-hover:text-slate-100 transition-colors">
-                          {file.name}
-                        </p>
-                      )}
-
-                      <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono mt-0.5">
-                        <span>{formatSize(file.size)}</span>
-                        <span>•</span>
-                        {file.analysis ? (
-                          <span className="text-emerald-400 flex items-center gap-0.5">
-                            <CheckCircle className="w-2.5 h-2.5" /> Ready
-                          </span>
-                        ) : (
-                          <span className="text-amber-400">Processing...</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Actions on hover */}
-                  <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onToggleFavorite(file.id);
-                      }}
-                      className={`p-1 rounded hover:bg-slate-700 ${
-                        file.isFavorite ? "text-amber-400" : "text-slate-400 hover:text-amber-300"
-                      }`}
-                      title="Mark as Favorite"
-                    >
-                      <Star className="w-3.5 h-3.5" fill={file.isFavorite ? "currentColor" : "none"} />
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={(e) => handleStartRename(file, e)}
-                      className="p-1 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700"
-                      title="Rename"
-                    >
-                      <Edit2 className="w-3.5 h-3.5" />
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDeleteFile(file.id);
-                      }}
-                      className="p-1 rounded text-slate-400 hover:text-red-400 hover:bg-red-500/10"
-                      title="Delete"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
+          return (
+            <div
+              key={file.id}
+              className={`group flex items-center justify-between p-2.5 rounded-xl transition-all duration-200 border cursor-pointer ${
+                isActive
+                  ? "bg-slate-800 border-slate-600 shadow-md shadow-emerald-950/20"
+                  : "bg-slate-900/60 border-slate-800 hover:border-slate-700 hover:bg-slate-800/40"
+              }`}
+              onClick={() => onSelectFile(file.id)}
+              id={`history-item-${file.id}`}
+            >
+              <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                <div className={`p-2 rounded-lg ${badge.bg} shrink-0`}>
+                  {badge.icon}
                 </div>
-
-                {/* Tags and Folder pill */}
-                <div className="flex flex-wrap items-center gap-1 mt-2">
-                  {/* Move to folder quick select */}
-                  <select
-                    value={file.folderId || "all"}
-                    onChange={(e) => {
-                      e.stopPropagation();
-                      onMoveFile(file.id, e.target.value);
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                    className="bg-slate-950 border border-slate-800 text-[10px] text-slate-400 rounded px-1 py-0.5 focus:outline-none"
-                  >
-                    <option value="contracts">Contracts</option>
-                    <option value="invoices">Invoices</option>
-                    <option value="resumes">Resumes</option>
-                    <option value="legal">Legal</option>
-                    <option value="other">General</option>
-                  </select>
-
-                  {/* Custom Tags */}
-                  {(file.tags || []).map((t, idx) => (
-                    <span
-                      key={idx}
-                      className="px-1.5 py-0.5 rounded bg-slate-800 text-[9px] font-mono text-slate-300 border border-slate-700"
-                    >
-                      #{t}
-                    </span>
-                  ))}
-
-                  {/* Add Tag prompt */}
-                  {tagInputFileId === file.id ? (
-                    <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                      <input
-                        type="text"
-                        value={newTagInput}
-                        onChange={(e) => setNewTagInput(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && handleAddTagSubmit(file.id, e)}
-                        placeholder="tag..."
-                        className="bg-slate-950 border border-slate-700 text-[10px] text-slate-200 rounded px-1 py-0.5 w-16"
-                        autoFocus
-                      />
-                      <button
-                        type="button"
-                        onClick={(e) => handleAddTagSubmit(file.id, e)}
-                        className="text-emerald-400 hover:underline text-[10px]"
-                      >
-                        Add
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setTagInputFileId(file.id);
-                      }}
-                      className="text-[10px] text-slate-500 hover:text-slate-300 flex items-center gap-0.5"
-                    >
-                      <Plus className="w-2.5 h-2.5" /> Tag
-                    </button>
-                  )}
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-medium text-slate-200 truncate group-hover:text-slate-100 transition-colors">
+                    {file.name}
+                  </p>
+                  <div className="flex items-center gap-1.5 mt-0.5 text-[11px] text-slate-400 font-mono">
+                    <span className="font-semibold text-slate-300">{badge.label}</span>
+                    <span>•</span>
+                    <span>{formatSize(file.size)}</span>
+                    {file.analysis && (
+                      <>
+                        <span>•</span>
+                        <span className="flex items-center gap-0.5 text-emerald-400 font-medium text-[10px]">
+                          <CheckCircle className="w-3 h-3 inline" /> Done
+                        </span>
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
-            );
-          })
-        )}
+
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDeleteFile(file.id);
+                }}
+                className="p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-all opacity-0 group-hover:opacity-100 focus:opacity-100 cursor-pointer"
+                aria-label="Delete history entry"
+                id={`btn-delete-${file.id}`}
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

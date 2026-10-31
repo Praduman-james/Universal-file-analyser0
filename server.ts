@@ -9,7 +9,7 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-// Set up large payload limits for PDF, video, image and document analysis
+// Set up large payload limits for PDF, Excel, video, image and document analysis (50MB)
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
@@ -34,58 +34,25 @@ function getGeminiClient(): GoogleGenAI {
   return aiClient;
 }
 
-// Models to try in order of availability & stability
-const CANDIDATE_MODELS = [
-  "gemini-2.5-flash",
-  "gemini-3.1-flash-lite",
-  "gemini-3.8-flash",
-];
-
-function isTransientError(error: any): boolean {
-  if (!error) return false;
-  const status = error.status || error.code || error.error?.code || error.error?.status;
-  const msg = (error.message || error.toString() || "").toLowerCase();
-  return (
-    status === 503 ||
-    status === "503" ||
-    status === "UNAVAILABLE" ||
-    status === 429 ||
-    status === "429" ||
-    status === "RESOURCE_EXHAUSTED" ||
-    msg.includes("503") ||
-    msg.includes("unavailable") ||
-    msg.includes("high demand") ||
-    msg.includes("overloaded") ||
-    msg.includes("spikes in demand") ||
-    msg.includes("rate limit") ||
-    msg.includes("resource_exhausted")
-  );
-}
-
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Helper to attempt generation with silent fallback to alternative models if high demand or 503 occurs
+// Helper to attempt generation with fallback to 2.5 flash if 3.8 flash is busy
 async function generateContentWithFallback(ai: GoogleGenAI, requestOptions: any) {
-  let lastError: any = null;
-
-  for (const model of CANDIDATE_MODELS) {
-    try {
+  try {
+    return await ai.models.generateContent({
+      ...requestOptions,
+      model: "gemini-3.8-flash",
+    });
+  } catch (error: any) {
+    console.warn("gemini-3.8-flash failed:", error.message);
+    const isUnavailable = error.status === 503 || error.message?.includes("503") || error.message?.includes("high demand");
+    if (isUnavailable) {
+      console.warn("Falling back to gemini-2.5-flash due to high demand...");
       return await ai.models.generateContent({
         ...requestOptions,
-        model,
+        model: "gemini-2.5-flash",
       });
-    } catch (error: any) {
-      lastError = error;
-      if (isTransientError(error)) {
-        // Silently shift to the next candidate model without polluting stderr/build monitors
-        continue;
-      }
-      // Non-transient error (e.g. invalid parameter), break immediately
-      break;
     }
+    throw error;
   }
-
-  throw lastError || new Error("AI services are temporarily busy. Please try again shortly.");
 }
 
 // HEALTH CHECK ENDPOINT
@@ -103,10 +70,10 @@ app.post("/api/analyze", async (req, res) => {
       isImage,
       isVideo,
       isPdf,
+      isExcel,
       base64Data,
-      docMode = "auto",
-      language = "en",
-      personaMode = "general",
+      imageDimensions,
+      excelSheets,
     } = req.body;
 
     if (!fileName) {
@@ -115,115 +82,144 @@ app.post("/api/analyze", async (req, res) => {
 
     const ai = getGeminiClient();
 
-    let langInstruction = "";
-    if (language === "hi") {
-      langInstruction = `Output ALL narrative fields (summary, insight titles, descriptions, recommendations) in fluent Hindi (Devanagari script). Retain exact proper nouns, numbers, currencies, and technical terms. Provide exact page/clause citations like [Page 1, Para 2] or [धारा 4.1].`;
-    } else if (language === "hinglish") {
-      langInstruction = `Output explanations in natural, clear Hinglish (conversational Hindi-English blend written in Latin script) widely used in Indian business, legal, and tech contexts.`;
-    } else if (language === "regional") {
-      langInstruction = `Perform OCR on any Indian regional language text (e.g. Hindi, Marathi, Bengali, Tamil, Telugu, Gujarati). Transcribe accurately and provide bilingual explanations in English and Hindi.`;
-    } else {
-      langInstruction = `Provide answers in clear, professional English. If the document is in Hindi or regional languages, translate and provide bilingual context with citations.`;
-    }
+    // Check file category
+    const isPdfFile = Boolean(isPdf) || fileType === "application/pdf" || fileName.toLowerCase().endsWith(".pdf");
+    const isExcelFile =
+      Boolean(isExcel) ||
+      fileName.toLowerCase().endsWith(".xlsx") ||
+      fileName.toLowerCase().endsWith(".xls") ||
+      (fileType && (fileType.includes("spreadsheet") || fileType.includes("excel")));
+    const isJpg = fileName.toLowerCase().endsWith(".jpg") || fileName.toLowerCase().endsWith(".jpeg") || fileType === "image/jpeg";
+    const isPng = fileName.toLowerCase().endsWith(".png") || fileType === "image/png";
+    const isImageFile = Boolean(isImage) || isJpg || isPng || (fileType && fileType.startsWith("image/"));
 
-    let personaInstruction = "";
-    if (personaMode === "lawyer") {
-      personaInstruction = `\nLAWYER MODE ACTIVATED: You are acting as senior corporate & litigation legal counsel. Scrutinize clauses with extreme legal rigor. Emphasize: unilateral liabilities, uncapped indemnities, ambiguous termination rights, non-compete reasonableness under Indian Contract Act, arbitration clauses, jurisdiction, and statutory compliance risks.`;
-    } else if (personaMode === "accountant") {
-      personaInstruction = `\nACCOUNTANT MODE ACTIVATED: You are acting as a Chartered Accountant and forensic auditor. Scrutinize all numerical values with mathematical precision. Verify 15-character GSTIN structure, perform arithmetic cross-validation of total amounts against line-item sub-totals, check CGST (9%) + SGST (9%) or IGST (18%) percentages, flag missing invoice dates or serials, and identify unusual debits/credits.`;
-    }
+    const systemInstruction = `You are a world-class File Analyzer, Forensic Media Specialist, Financial Data Scientist, and Quantitative Analyst.
+Your mission is to perform comprehensive, in-depth analysis of files:
+- For Excel Workbooks (.xlsx, .xls): Conduct exhaustive multi-sheet financial and operational data science audits. Compute aggregations, calculate key KPI formulas (SUM, AVERAGE, variance, ratios), evaluate column profiles, identify data anomalies (e.g. negative numbers, outliers, empty cells, budget overruns), and summarize each individual worksheet.
+- For PDF Documents: Conduct full structural, semantic, and textual forensic analysis. Classify document type (Invoice, Contract, Academic Paper, Report, Resume, Manual, Financial Statement, etc.), outline key sections, extract visible text/OCR, highlight key figures, dates, and actionable clauses.
+- For JPG / JPEG Images: Evaluate visual composition, photographic style, lighting, depth, compression artifacts, dominant color palette (with exact hex codes), optical character recognition (OCR) of text in the image, and detected objects.
+- For PNG Images: Examine pixel precision, alpha transparency, typography/UI elements, graphics structure, dominant colors (with hex codes), OCR text, and design clarity.
+- For Videos: Extract narrative, chronological progression, key scenes, pacing, motion dynamics, audio, and visual tone.
+- For Code / Data / Text: Audit syntax, schema, data distributions, architecture, and complexity.
 
-    // System prompt for structured file analysis
-    const systemInstruction = `You are an elite Document Intelligence, Legal, Financial & Multimodal Analysis Agent.
-Your capabilities:
-1. Multi-format support: PDF, DOCX, XLSX, PPTX, Images (JPG, PNG, WebP), Videos (MP4, WebM), CSV, TXT, JSON, ZIP.
-2. OCR: High-precision OCR for printed and handwritten Hindi, English, and regional Indian scripts.
-3. Analysis Modes:
-   - "contract": Identify contracting parties, effective & expiry dates, liabilities, indemnity, auto-renewal, termination clauses, dispute jurisdiction. Include exact citations (e.g. "Page 2, Clause 4.2").
-   - "invoice": Extract vendor/buyer details, GSTIN/Tax IDs, invoice number, line-items table, taxes (CGST/SGST/IGST), total payable, bank details.
-   - "receipt": Extract merchant, date/time, line items, taxes, payment mode, expense category.
-   - "resume": Extract candidate contact, total experience, technical skills matrix, education, ATS score (0-100), improvement tips.
-   - "bank_statement": Extract account holder, bank, statement period, opening/closing balance, total credit/debit, recurring transactions, high-value alerts.
-   - "legal_notice": Extract sender/recipient, claims, legal statutes (e.g. Section 138 NI Act, CPC), remedies, response deadline, actionable legal options.
-   - "general" or "auto": Automatically classify and adapt.
-4. Always provide exact page, paragraph, or clause citations where applicable (e.g. "Page 1, Para 3", "Clause 8.1", "Row 14").
-5. Extract structured tables as arrays of headers and rows for export to CSV/Excel.
-6. Detect Sensitive Information (PII) including Aadhaar (12 digits), PAN (5 letters + 4 digits + 1 letter), Phone numbers, Emails, Credit Cards, Bank Accounts.
-7. ${langInstruction}${personaInstruction}`;
+Always return highly structured, precise JSON matching the requested schema. Provide rich, factual, concrete insights without fluff.`;
 
-    let prompt = "";
     let contents: any[] = [];
 
-    if (isPdf && base64Data) {
-      // Inline PDF document analysis
+    if (isExcelFile) {
+      // EXCEL WORKBOOK QUANTITATIVE ANALYSIS
+      const truncatedContent = (fileContent || "").length > 80000 
+        ? (fileContent || "").substring(0, 80000) + "\n... [Remaining Rows Truncated for AI context] ..."
+        : (fileContent || "");
+
+      const sheetCount = excelSheets?.length || 1;
+      const totalRecords = excelSheets?.reduce((acc: number, s: any) => acc + (s.rowCount || 0), 0) || 0;
+
+      const prompt = `Perform an advanced, quantitative data science and financial audit of this Excel Workbook titled "${fileName}".
+This workbook contains ${sheetCount} sheet(s) with approximately ${totalRecords} data rows.
+Here is the multi-sheet data export:
+\`\`\`
+${truncatedContent}
+\`\`\`
+
+Provide:
+1. Executive summary (summary): 2-3 sentences covering the purpose of the workbook, key business / operational domains, and the most significant takeaway from the numbers.
+2. Technical description (fileTypeDetails): e.g. "Microsoft Excel (.xlsx) Multi-Sheet Financial Model with ${sheetCount} Sheet(s)".
+3. Sheet summaries (excelSheetSummaries): An array for each sheet in the workbook with sheet name (name), row count (rowCount), column count (colCount), and a 1-sentence analytical synopsis (summary).
+4. Key Formulas & Calculated KPI Metrics (keyFormulasOrMetrics): 3 to 5 calculated quantitative totals or ratios (e.g. Total Revenue, Average Margin, Overall Variance, Burn Rate, Top Region / Department), including the recommended Excel formula (formula, e.g. "=SUM(F2:F11)", "=AVERAGE(E2:E11)", "=XLOOKUP(...)") and a brief description.
+5. 4 to 6 primary insights categorized into 'Financial', 'Spreadsheet', 'Metrics', 'Anomaly', 'Optimization', or 'Structure' (e.g., top-performing segments, under-budget departments, distribution trends, growth drivers).
+6. 4 key quickStats (e.g., 'Total Sheets', 'Total Records', 'Aggregate Sum / Revenue', 'Top Category').
+7. Data Anomalies (dataAnomalies): List 2 to 4 specific anomalies, outliers, negative values, discrepancies, or data hygiene observations found in the data rows.
+8. Technical specs: totalSheets (${sheetCount}), totalRows (${totalRecords}), hasFormulas (true).
+9. 4 highly tailored, actionable follow-up prompt suggestions that the user can ask regarding these sheets, formulas, or cross-tabulations.`;
+
+      contents = [{ text: prompt }];
+
+    } else if (isPdfFile && base64Data) {
+      // PDF Forensic and Document Analysis
       const pdfPart = {
         inlineData: {
           mimeType: "application/pdf",
           data: base64Data,
         },
       };
-      prompt = `Analyze this PDF document titled "${fileName}".
-Analysis Mode: ${docMode}.
-Language Preference: ${language}.
-Instructions:
-1. Detect document category (contract, invoice, receipt, resume, bank_statement, legal_notice, or general).
-2. Transcribe and extract all textual data (including Hindi/regional OCR if present).
-3. Extract 3-6 high-impact primary insights with EXACT page/paragraph citations (e.g. "Page 1, Para 2" or "Clause 3.1").
-4. Extract 3-5 quick key stats/metrics (e.g. Total Amount, Due Date, Parties, Pages, ATS Score, Word Count).
-5. Extract any structured tabular data into the "extractedTables" field.
-6. Detect any PII (Aadhaar, PAN, Phone, Email, Bank Account, Credit Card) with masked values.
-7. Provide 3-4 insightful suggested follow-up prompts.`;
+      const prompt = `Perform an exhaustive, professional document analysis of this PDF file titled "${fileName}".
+Inspect all readable pages, typography, tables, headings, and metadata.
+Provide:
+1. A concise, authoritative executive summary (2-3 sentences) covering the purpose, audience, and main message of the document.
+2. Document Classification (documentType) e.g., "Financial Invoice", "Legal Agreement / Contract", "Scientific Research Paper", "Executive Brief / Whitepaper", "Curriculum Vitae / Resume", "Technical Manual / Specification", or "Corporate Report".
+3. 4-6 primary insights categorized into 'Document', 'Structure', 'Content', 'Metrics', 'Quality', or 'Anomaly' (e.g. key covenants, dates, financial totals, legal parties, methodologies, conclusions, risks).
+4. 4 key quickStats (e.g. Page Count, Word Count, Language, Estimated Reading Time, Key Entity / Issuer).
+5. Document Outline (major sections or headings with short summaries and page reference).
+6. Extracted Text / OCR: transcribing the key headings, paragraphs, and critical data points from the document.
+7. Technical specs: estimated pages, estimated word count, language, reading time in minutes.
+8. 4 specific, high-value prompt suggestions for follow-up questions the user can ask regarding this PDF's data, clauses, or numbers.`;
+
       contents = [pdfPart, { text: prompt }];
+
+    } else if (isImageFile && base64Data) {
+      // JPG / PNG Image Analysis
+      const mimeType = isJpg ? "image/jpeg" : isPng ? "image/png" : (fileType || "image/png");
+      const formatLabel = isPng ? "PNG (Portable Network Graphics)" : isJpg ? "JPG / JPEG Image" : "Image File";
+
+      const imagePart = {
+        inlineData: {
+          mimeType,
+          data: base64Data,
+        },
+      };
+
+      const dimInfo = imageDimensions ? `Known Client Resolution: ${imageDimensions.width}x${imageDimensions.height} px.` : "";
+
+      const prompt = `Perform a forensic visual and semantic analysis of this ${formatLabel} titled "${fileName}". ${dimInfo}
+Inspect the visual composition, subject matter, text/signage/branding, color scheme, and technical fidelity.
+Provide:
+1. An overarching summary of what is depicted, its context, artistic or functional intent, and key visual focal points.
+2. Technical description (fileTypeDetails) noting format nuances (e.g. "${isPng ? "PNG Raster with Alpha Channel & Sharp Edges" : "High-Fidelity JPEG Photographic Stream with Natural Tone Gradients"}").
+3. Dominant Color Palette (dominantColors): 4 to 6 primary colors found in the image. For each, give an exact 6-character hex code (e.g., "#1E293B", "#10B981"), a descriptive color name (e.g., "Deep Emerald", "Slate Navy", "Warm Ivory"), and an estimated visual area percentage.
+4. Detected Objects & Visual Tags (detectedObjects): 5 to 10 prominent items, themes, visual motifs, or UI elements.
+5. Extracted Text / OCR (extractedText): Transcribe ANY visible text, signage, logos, labels, captions, or typography seen within the image. If absolutely no text exists, return an empty string.
+6. 4 primary insights categorized into 'Visual', 'Palette', 'OCR', 'Quality', 'Structure', or 'Optimization'.
+7. 4 key quickStats (e.g., Primary Aspect Ratio, Dominant Color, Subject Type, Visual Sharpness / Quality Score).
+8. Technical specs including estimated aspect ratio, colorSpace (sRGB), hasAlpha (${isPng ? "true" : "false"}).
+9. 4 engaging follow-up suggested prompts tailored to this specific image (e.g. color adjustments, OCR translation, design audit, composition breakdown).`;
+
+      contents = [imagePart, { text: prompt }];
+
     } else if (isVideo && base64Data) {
-      // Video analysis
+      // Video Analysis
       const videoPart = {
         inlineData: {
           mimeType: fileType || "video/mp4",
           data: base64Data,
         },
       };
-      prompt = `Analyze this video file titled "${fileName}". 
-Extract key scenes, chronological flow, narrative actions, visual composition, pacing, dialogue/audio presence, and timestamp markers.
+      const prompt = `Analyze this video file titled "${fileName}". 
+Extract key scenes, chronological flow, narrative or demonstration actions, visual composition, pacing, notable objects, transitions, and any dialogue or audio elements present.
 Provide:
-1. Executive summary of video content.
-2. 3-5 primary insights with timestamp citations (e.g. "00:15 - Scene 1").
-3. 2-4 key video metrics as quickStats.
-4. Suggested follow-up prompts.`;
+1. An overarching executive summary of the video content and narrative.
+2. 3-5 specific, high-value primary insights covering key scenes, visual clarity, transitions, audio/transcript summary, or highlighted timestamps.
+3. 4 key video metrics or properties (e.g. estimated duration, pacing/tempo, motion dynamics, visual style, audio presence) as "quickStats".
+4. 3 creative and tailored prompt suggestions for user inquiries.`;
       contents = [videoPart, { text: prompt }];
-    } else if (isImage && base64Data) {
-      // Image analysis with OCR
-      const imagePart = {
-        inlineData: {
-          mimeType: fileType || "image/png",
-          data: base64Data,
-        },
-      };
-      prompt = `Analyze this image titled "${fileName}".
-Analysis Mode: ${docMode}.
-Language Preference: ${language}.
-Perform comprehensive OCR (English, Hindi, and regional scripts). 
-If it is a document, invoice, receipt, ID card, or contract page, parse its structure, detect PII, extract tables if visible, and provide exact citations and key stats. Include full OCR text in "ocrText".`;
-      contents = [imagePart, { text: prompt }];
+
     } else {
-      // Text, Office DOCX, PPTX, CSV, JSON, ZIP
-      const truncatedContent = (fileContent || "").length > 90000 
-        ? (fileContent || "").substring(0, 90000) + "\n... [Content Truncated due to size] ..."
+      // Text, CSV, JSON, Markdown, or Code analysis
+      const truncatedContent = (fileContent || "").length > 80000 
+        ? (fileContent || "").substring(0, 80000) + "\n... [Content Truncated due to size] ..."
         : (fileContent || "");
 
-      prompt = `Analyze the uploaded document "${fileName}" (type: ${fileType || "Plain Text"}).
-Analysis Mode: ${docMode}.
-Language Preference: ${language}.
-Document content:
+      const prompt = `Analyze the uploaded file "${fileName}" (type: ${fileType || "Plain Text"}). 
+Here is the file content:
 \`\`\`
 ${truncatedContent}
 \`\`\`
-Perform:
-1. Summarize the document's primary purpose, key entities, and findings.
-2. Formulate 3-6 high-value primary insights with exact page, clause, or line citations.
-3. Extract 3-5 key metrics/properties as quickStats.
-4. Extract any tabular data into "extractedTables" (headers & rows).
-5. Detect any PII (Aadhaar, PAN, phone, email, accounts) for redaction.
-6. Suggest 3-4 specific, actionable follow-up questions.`;
+
+Perform the following:
+1. Summarize the file's primary purpose or contents.
+2. Formulate 3-5 high-value structural or content-related primary insights.
+3. Extract 4 key metrics or properties (e.g., lines of code, rows of data, column names, word counts, nested levels, validation status, syntax style) as "quickStats".
+4. Suggest 3 useful, specific, and creative prompts that the user can ask regarding this file's data or code.`;
       contents = [{ text: prompt }];
     }
 
@@ -239,246 +235,141 @@ Perform:
           properties: {
             summary: {
               type: Type.STRING,
-              description: "A comprehensive executive overview of the document contents, context, and purpose in the requested language.",
+              description: "A professional 2-3 sentence overview of the file's content and overall purpose.",
             },
             fileTypeDetails: {
               type: Type.STRING,
-              description: "A precise technical summary (e.g. 'Bilingual Service Contract PDF', 'GST Tax Invoice', 'Indian Bank Statement XLSX', 'Software Engineer Resume').",
+              description: "A brief technical summary of the format (e.g. 'Microsoft Excel (.xlsx) Multi-Sheet Financial Model', 'PDF Document', 'JPEG Photographic Image', 'PNG Raster Graphic with Alpha').",
             },
-            detectedLanguage: {
+            documentType: {
               type: Type.STRING,
-              description: "Language(s) detected in the file (e.g. 'English + Hindi Bilingual', 'English', 'Hindi Devanagari', 'Marathi').",
+              description: "Classification for documents/PDFs (e.g. 'Financial Invoice', 'Legal Contract', 'Resume / CV', 'Academic Paper', 'Corporate Report', 'User Manual'). Leave blank or null if not a document.",
             },
-            detectedDocMode: {
+            extractedText: {
               type: Type.STRING,
-              description: "Detected document class: 'contract', 'invoice', 'receipt', 'resume', 'bank_statement', 'legal_notice', or 'general'.",
+              description: "Transcribed OCR text found in the image or key text/data extracted from the PDF document. Empty string if none.",
+            },
+            dominantColors: {
+              type: Type.ARRAY,
+              description: "For images: 3 to 6 dominant colors with hex code, name, and visual coverage percentage.",
+              items: {
+                type: Type.OBJECT,
+                required: ["hex", "name"],
+                properties: {
+                  hex: { type: Type.STRING, description: "Valid 6-character hex string including '#' like '#10B981'" },
+                  name: { type: Type.STRING, description: "Descriptive name like 'Emerald Green'" },
+                  percentage: { type: Type.STRING, description: "Estimated percentage like '45%'" }
+                }
+              }
+            },
+            detectedObjects: {
+              type: Type.ARRAY,
+              description: "List of detected visual elements, subjects, objects, or UI components for images.",
+              items: { type: Type.STRING }
+            },
+            documentOutline: {
+              type: Type.ARRAY,
+              description: "For PDFs: outline of major document sections with headings and summaries.",
+              items: {
+                type: Type.OBJECT,
+                required: ["heading", "summary"],
+                properties: {
+                  heading: { type: Type.STRING, description: "Section or clause title" },
+                  summary: { type: Type.STRING, description: "Brief 1-sentence synopsis of this section" },
+                  page: { type: Type.STRING, description: "Page number or section ID if identifiable" }
+                }
+              }
+            },
+            excelSheetSummaries: {
+              type: Type.ARRAY,
+              description: "For Excel: summary of each sheet in the workbook.",
+              items: {
+                type: Type.OBJECT,
+                required: ["name", "rowCount", "colCount", "summary"],
+                properties: {
+                  name: { type: Type.STRING, description: "Sheet tab name" },
+                  rowCount: { type: Type.NUMBER, description: "Number of data rows" },
+                  colCount: { type: Type.NUMBER, description: "Number of columns" },
+                  summary: { type: Type.STRING, description: "Concise analytical summary of this sheet" }
+                }
+              }
+            },
+            keyFormulasOrMetrics: {
+              type: Type.ARRAY,
+              description: "For Excel / Datasets: calculated KPI metrics with suggested Excel formula.",
+              items: {
+                type: Type.OBJECT,
+                required: ["label", "value"],
+                properties: {
+                  label: { type: Type.STRING, description: "Metric title, e.g. 'Total Q3 Revenue' or 'Average Margin'" },
+                  value: { type: Type.STRING, description: "Computed value or amount" },
+                  formula: { type: Type.STRING, description: "Suggested Excel formula e.g. '=SUM(F2:F11)' or '=AVERAGE(E2:E11)'" },
+                  description: { type: Type.STRING, description: "Short rationale or explanation" }
+                }
+              }
+            },
+            dataAnomalies: {
+              type: Type.ARRAY,
+              description: "For Excel / Data: list of detected anomalies, negative values, discrepancies, or outliers.",
+              items: { type: Type.STRING }
+            },
+            technicalSpecs: {
+              type: Type.OBJECT,
+              description: "Technical properties of the file.",
+              properties: {
+                format: { type: Type.STRING },
+                dimensions: { type: Type.STRING },
+                megapixels: { type: Type.STRING },
+                aspectRatio: { type: Type.STRING },
+                colorSpace: { type: Type.STRING },
+                hasAlpha: { type: Type.BOOLEAN },
+                estimatedPages: { type: Type.NUMBER },
+                wordCount: { type: Type.NUMBER },
+                language: { type: Type.STRING },
+                readingTimeMinutes: { type: Type.NUMBER },
+                totalSheets: { type: Type.NUMBER },
+                totalRows: { type: Type.NUMBER },
+                totalColumns: { type: Type.NUMBER },
+                hasFormulas: { type: Type.BOOLEAN }
+              }
             },
             primaryInsights: {
               type: Type.ARRAY,
-              description: "3 to 6 key discoveries, clauses, obligations, financial items, or quality audits.",
+              description: "3 to 6 key discoveries, observations, quality audits, patterns, or trends found in the file.",
               items: {
                 type: Type.OBJECT,
                 required: ["title", "description", "category"],
                 properties: {
-                  title: { type: Type.STRING, description: "Concise title for the insight." },
-                  description: { type: Type.STRING, description: "Detailed explanation with specific evidence and findings." },
-                  category: {
-                    type: Type.STRING,
-                    description: "One of: 'Structure', 'Quality', 'Metrics', 'Optimization', 'Content', 'Visual', 'Video', 'Audio', 'Anomaly', 'Legal', 'Financial', 'Obligation', 'Compliance'",
-                  },
-                  citation: {
-                    type: Type.STRING,
-                    description: "Exact citation in the document, e.g. 'Page 2, Clause 4.1', 'Paragraph 3', 'Row 15', '00:45'.",
-                  },
-                },
-              },
+                  title: { type: Type.STRING, description: "A concise, engaging title for the insight." },
+                  description: { type: Type.STRING, description: "Detailed explanation of the insight with specific examples." },
+                  category: { 
+                    type: Type.STRING, 
+                    description: "One of: 'Document', 'OCR', 'Palette', 'Structure', 'Quality', 'Metrics', 'Optimization', 'Content', 'Visual', 'Video', 'Audio', 'Anomaly', 'Spreadsheet', 'Financial', 'Formula'" 
+                  }
+                }
+              }
             },
             quickStats: {
               type: Type.ARRAY,
-              description: "Key metrics extracted from the document.",
+              description: "Key metrics or properties extracted from the file metadata/contents.",
               items: {
                 type: Type.OBJECT,
                 required: ["label", "value", "unit"],
                 properties: {
-                  label: { type: Type.STRING, description: "Metric label, e.g., 'Total GST', 'Contract Term', 'ATS Score', 'Notice Deadline'." },
+                  label: { type: Type.STRING, description: "Metric label, e.g., 'Sheets', 'Total Records', 'Revenue', 'Pages', 'Resolution'." },
                   value: { type: Type.STRING, description: "The calculated metric value." },
-                  unit: { type: Type.STRING, description: "Unit of measurement or blank." },
-                },
-              },
-            },
-            extractedTables: {
-              type: Type.ARRAY,
-              description: "Structured tables extracted from the document for CSV/Excel export.",
-              items: {
-                type: Type.OBJECT,
-                required: ["title", "headers", "rows"],
-                properties: {
-                  title: { type: Type.STRING, description: "Table title or caption" },
-                  headers: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  rows: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING },
-                    },
-                  },
-                  pageOrSection: { type: Type.STRING, description: "Page or section where table was found." },
-                },
-              },
-            },
-            piiDetected: {
-              type: Type.ARRAY,
-              description: "List of sensitive personal or financial information found.",
-              items: {
-                type: Type.OBJECT,
-                required: ["type", "value", "maskedValue", "riskLevel"],
-                properties: {
-                  type: { type: Type.STRING, description: "'Aadhaar', 'PAN', 'Phone', 'Email', 'Credit Card', 'Bank Account', 'SSN', 'Address', or 'Name'" },
-                  value: { type: Type.STRING, description: "Raw sensitive value detected" },
-                  maskedValue: { type: Type.STRING, description: "Redacted or masked value, e.g. 'XXXX-XXXX-1234'" },
-                  riskLevel: { type: Type.STRING, description: "'High', 'Medium', or 'Low'" },
-                  pageOrLocation: { type: Type.STRING, description: "Location in document" },
-                },
-              },
-            },
-            ocrText: {
-              type: Type.STRING,
-              description: "Full transcribed searchable text layer from OCR if applicable.",
+                  unit: { type: Type.STRING, description: "Unit of measurement, or leave blank if none." }
+                }
+              }
             },
             suggestedPrompts: {
               type: Type.ARRAY,
-              description: "3-4 tailored follow-up question prompts.",
-              items: { type: Type.STRING },
-            },
-            // Contract specific intelligence
-            contractDetails: {
-              type: Type.OBJECT,
-              description: "Extracted contract details if the document is an agreement, contract, NDA, lease, or legal deed.",
-              properties: {
-                parties: { type: Type.ARRAY, items: { type: Type.STRING }, description: "All contracting parties named." },
-                obligations: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      party: { type: Type.STRING },
-                      obligation: { type: Type.STRING },
-                      citation: { type: Type.STRING },
-                    },
-                  },
-                },
-                dates: {
-                  type: Type.OBJECT,
-                  properties: {
-                    effective: { type: Type.STRING },
-                    expiry: { type: Type.STRING },
-                    keyDeadlines: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  },
-                },
-                paymentTerms: { type: Type.STRING },
-                terminationClauses: { type: Type.STRING },
-                jurisdiction: { type: Type.STRING },
-                riskFlags: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      flag: { type: Type.STRING },
-                      severity: { type: Type.STRING, description: "'High', 'Medium', or 'Low'" },
-                      citation: { type: Type.STRING },
-                    },
-                  },
-                },
-              },
-            },
-            // Invoice specific intelligence
-            invoiceDetails: {
-              type: Type.OBJECT,
-              description: "Extracted invoice fields if document is an invoice or bill.",
-              properties: {
-                vendor: { type: Type.STRING },
-                invoiceNumber: { type: Type.STRING },
-                date: { type: Type.STRING },
-                dueDate: { type: Type.STRING },
-                tax: { type: Type.STRING },
-                total: { type: Type.STRING },
-              },
-            },
-            // Receipt specific intelligence
-            receiptDetails: {
-              type: Type.OBJECT,
-              description: "Extracted receipt details if document is a point-of-sale receipt or expense ticket.",
-              properties: {
-                merchant: { type: Type.STRING },
-                amount: { type: Type.STRING },
-                category: { type: Type.STRING },
-                date: { type: Type.STRING },
-              },
-            },
-            // Resume specific intelligence
-            resumeDetails: {
-              type: Type.OBJECT,
-              description: "Extracted resume breakdown if document is a CV or resume.",
-              properties: {
-                skills: { type: Type.ARRAY, items: { type: Type.STRING } },
-                experience: { type: Type.ARRAY, items: { type: Type.STRING } },
-                education: { type: Type.ARRAY, items: { type: Type.STRING } },
-                jobMatchSummary: { type: Type.STRING },
-              },
-            },
-            // Bank statement specific intelligence
-            bankStatementDetails: {
-              type: Type.OBJECT,
-              description: "Extracted financial statement metrics if document is a bank statement or passbook.",
-              properties: {
-                income: { type: Type.STRING },
-                expenses: { type: Type.STRING },
-                recurringPayments: { type: Type.ARRAY, items: { type: Type.STRING } },
-                unusualTransactions: { type: Type.ARRAY, items: { type: Type.STRING } },
-              },
-            },
-            // XLSX/CSV Dataset specific intelligence
-            datasetDetails: {
-              type: Type.OBJECT,
-              description: "Structured dataset explanation, trends, totals, and charts if document is a spreadsheet or CSV table.",
-              properties: {
-                columnExplanations: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      column: { type: Type.STRING },
-                      explanation: { type: Type.STRING },
-                    },
-                  },
-                },
-                totals: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      metric: { type: Type.STRING },
-                      value: { type: Type.STRING },
-                    },
-                  },
-                },
-                trends: { type: Type.ARRAY, items: { type: Type.STRING } },
-                simpleCharts: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING },
-                      labels: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      values: { type: Type.ARRAY, items: { type: Type.NUMBER } },
-                    },
-                  },
-                },
-              },
-            },
-            // Image specific intelligence
-            imageDetails: {
-              type: Type.OBJECT,
-              description: "Visual analysis, classification, and OCR field extraction if document is an image or photo scan.",
-              properties: {
-                ocrText: { type: Type.STRING },
-                description: { type: Type.STRING },
-                classification: { type: Type.STRING },
-                extractedFields: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      field: { type: Type.STRING },
-                      value: { type: Type.STRING },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
+              description: "3 to 4 highly tailored follow-up question prompts.",
+              items: { type: Type.STRING }
+            }
+          }
+        }
+      }
     });
 
     const resultText = response.text;
@@ -498,209 +389,10 @@ Perform:
   }
 });
 
-// EXPLAIN DIFFICULT TEXT / JARGON / CLAUSE API (For PDF, DOCX, Contracts, Legal, Technical)
-app.post("/api/explain-text", async (req, res) => {
-  try {
-    const { textToExplain, fileContext = "", language = "en" } = req.body;
-
-    if (!textToExplain) {
-      return res.status(400).json({ error: "textToExplain is required" });
-    }
-
-    const ai = getGeminiClient();
-    const systemInstruction = `You are a Legal, Technical, and Linguistic Document Intelligence Specialist.
-Your task is to take difficult, dense, jargon-laden, or complex clauses/sentences from documents (PDF, DOCX, Contracts, Policies) and make them crystal clear.
-Provide:
-1. plainExplanation: Clear, simple explanation that anyone can understand without technical training.
-2. legalOrTechnicalBreakdown: Point-by-point breakdown of rights, conditions, obligations, or risks.
-3. hindiTranslation: Fluent Hindi explanation (Devanagari script) explaining what this means.
-4. keyTakeaway: Direct 1-line actionable advice or meaning for the reader.`;
-
-    const prompt = `Explain and simplify this difficult text:
-"${textToExplain}"
-
-Document Context:
-${fileContext}`;
-
-    const response = await generateContentWithFallback(ai, {
-      contents: [{ text: prompt }],
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          required: ["plainExplanation", "legalOrTechnicalBreakdown", "hindiTranslation", "keyTakeaway"],
-          properties: {
-            plainExplanation: { type: Type.STRING },
-            legalOrTechnicalBreakdown: { type: Type.STRING },
-            hindiTranslation: { type: Type.STRING },
-            keyTakeaway: { type: Type.STRING },
-          },
-        },
-      },
-    });
-
-    const output = JSON.parse(response.text?.trim() || "{}");
-    return res.json(output);
-  } catch (error: any) {
-    console.error("Explain Text Error:", error);
-    return res.status(500).json({ error: error.message || "Failed to explain text" });
-  }
-});
-
-// ON-DEMAND TRANSLATE API
-app.post("/api/translate", async (req, res) => {
-  try {
-    const { text, targetLanguage = "hi" } = req.body;
-
-    if (!text) {
-      return res.status(400).json({ error: "text is required" });
-    }
-
-    const ai = getGeminiClient();
-    let langName = "Hindi (Devanagari script)";
-    if (targetLanguage === "en") langName = "English";
-    else if (targetLanguage === "hinglish") langName = "Hinglish (conversational Hindi-English in Latin alphabet)";
-    else if (targetLanguage === "mr") langName = "Marathi";
-    else if (targetLanguage === "bn") langName = "Bengali";
-
-    const prompt = `Translate the following text accurately into ${langName}. Preserve proper names, numbers, currencies, and technical terms:\n\n${text}`;
-
-    const response = await generateContentWithFallback(ai, {
-      contents: [{ text: prompt }],
-    });
-
-    return res.json({ translatedText: response.text?.trim() || text });
-  } catch (error: any) {
-    console.error("Translation Error:", error);
-    return res.status(500).json({ error: error.message || "Translation failed" });
-  }
-});
-
-// FILE COMPARISON API (Diff contracts, invoices, statements, or resumes)
-app.post("/api/compare", async (req, res) => {
-  try {
-    const { file1, file2, comparisonType = "auto", language = "en" } = req.body;
-
-    if (!file1 || !file2) {
-      return res.status(400).json({ error: "Both file1 and file2 are required for comparison" });
-    }
-
-    const ai = getGeminiClient();
-
-    let langInstruction = "";
-    if (language === "hi") {
-      langInstruction = `Output ALL narrative fields and difference explanations in clear Hindi (Devanagari script), preserving numbers and clause names.`;
-    } else if (language === "hinglish") {
-      langInstruction = `Output explanations in natural conversational Hinglish.`;
-    }
-
-    const systemInstruction = `You are a Senior Legal Counsel, Forensic Auditor, and Document Comparison Specialist.
-Your task is to compare two versions of a document, contract, invoice, resume, or financial statement.
-Highlight:
-1. Exact additions, deletions, and alterations.
-2. Financial shifts (prices, rates, taxes, totals, salaries).
-3. Clause-by-clause changes (indemnity, liability, termination, warranties, deadlines).
-4. Critical risk flags and strategic verdict.
-5. Exact citations to both documents where applicable.
-${langInstruction}`;
-
-    const prompt = `Compare these two documents:
-DOCUMENT 1: "${file1.name}" (${file1.type || "Document"})
-Summary: ${file1.summary || "No summary provided"}
-Content snippet:
-\`\`\`
-${(file1.content || "").substring(0, 45000)}
-\`\`\`
-
-DOCUMENT 2: "${file2.name}" (${file2.type || "Document"})
-Summary: ${file2.summary || "No summary provided"}
-Content snippet:
-\`\`\`
-${(file2.content || "").substring(0, 45000)}
-\`\`\`
-
-Comparison Mode: ${comparisonType}.
-Analyze every difference meticulously and output the structured JSON comparison.`;
-
-    const response = await generateContentWithFallback(ai, {
-      contents: [{ text: prompt }],
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          required: ["file1Name", "file2Name", "executiveSummary", "similarityScore", "majorDifferences", "verdict"],
-          properties: {
-            file1Name: { type: Type.STRING },
-            file2Name: { type: Type.STRING },
-            executiveSummary: { type: Type.STRING, description: "High-level overview of how the documents differ." },
-            similarityScore: { type: Type.NUMBER, description: "Percentage similarity between 0 and 100." },
-            majorDifferences: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                required: ["title", "description", "type"],
-                properties: {
-                  title: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  type: { type: Type.STRING, description: "'added', 'removed', 'modified', or 'risk'" },
-                  citation1: { type: Type.STRING, description: "Citation in Doc 1" },
-                  citation2: { type: Type.STRING, description: "Citation in Doc 2" },
-                },
-              },
-            },
-            financialShifts: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                required: ["item", "file1Value", "file2Value", "difference"],
-                properties: {
-                  item: { type: Type.STRING },
-                  file1Value: { type: Type.STRING },
-                  file2Value: { type: Type.STRING },
-                  difference: { type: Type.STRING },
-                },
-              },
-            },
-            clauseChanges: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                required: ["clauseName", "file1Text", "file2Text", "impact"],
-                properties: {
-                  clauseName: { type: Type.STRING },
-                  file1Text: { type: Type.STRING },
-                  file2Text: { type: Type.STRING },
-                  impact: { type: Type.STRING },
-                },
-              },
-            },
-            verdict: { type: Type.STRING, description: "Actionable summary recommendation on which version is preferable or key risks to negotiate." },
-          },
-        },
-      },
-    });
-
-    const resultText = response.text;
-    if (!resultText) {
-      throw new Error("Empty response from comparison");
-    }
-
-    return res.json(JSON.parse(resultText.trim()));
-  } catch (error: any) {
-    console.error("Comparison Error:", error);
-    return res.status(500).json({
-      error: error.message || "Failed to compare files",
-      details: error.stack,
-    });
-  }
-});
-
-// CHAT ASSISTANT API
+// CHAT ASSISTANT API WITH MULTIMODAL GROUNDING & EXCEL CONTEXT
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message, history, fileContext, language = "auto" } = req.body;
+    const { message, history, fileContext } = req.body;
 
     if (!message) {
       return res.status(400).json({ error: "message is required" });
@@ -709,39 +401,56 @@ app.post("/api/chat", async (req, res) => {
     const ai = getGeminiClient();
 
     // Reconstruct Chat history and compile with system instruction
-    const systemInstruction = `You are a conversational file and document assistant.
-You are discussing the file that was uploaded.
-Key rules:
-1. "Ask in Hindi, answer in Hindi": If the user's question is in Hindi (or Devanagari script), answer in fluent, respectful Hindi. If in Hinglish, answer in Hinglish. If in English, answer in English. You can also offer bilingual clarifications for complex legal/technical terms.
-2. Exact Citations: Whenever you cite facts, clauses, numbers, or conclusions, explicitly cite the exact location in brackets, e.g., "[Page 2, Para 4]" or "[Clause 7.2]" or "[Row 12]" or "[Timestamp 01:23]".
-3. Privacy: Never invent non-existent facts; stick strictly to the file context.
+    const systemInstruction = `You are an expert conversational File & Media Analyst, Financial Data Scientist, and Spreadsheet Consultant. 
+You are discussing the file that was uploaded:
+File Name: "${fileContext?.fileName || "Unknown"}"
+File Type: ${fileContext?.fileType || "General Document"}
+Summary: ${fileContext?.summary || ""}
+${fileContext?.documentType ? `Document Classification: ${fileContext.documentType}` : ""}
+${fileContext?.extractedText ? `Extracted OCR / Document Text:\n${fileContext.extractedText.slice(0, 10000)}` : ""}
+${fileContext?.isExcel ? `Excel Spreadsheet Data & Multi-Sheet Content:\n${(fileContext?.content || "").slice(0, 40000)}` : ""}
 
-File Context:
----
-File Name: ${fileContext.fileName}
-File Type: ${fileContext.fileType}
-Document Mode: ${fileContext.docMode || "General"}
-Analysis Summary: ${fileContext.summary}
-${fileContext.ocrText ? `OCR Transcribed Text:\n${fileContext.ocrText.substring(0, 30000)}\n` : ""}
-${fileContext.isVideo ? "Video Media File analyzed." : fileContext.content ? `File Contents (Truncated if large):\n${fileContext.content.substring(0, 50000)}` : "Visual/PDF data analyzed successfully."}
----`;
+Use both the file's visual/multimodal content, tabular dataset, and any contextual summary to provide deep, accurate answers:
+- If this is an Excel Spreadsheet (.xlsx, .xls): provide exact calculations (sums, averages, margins, variances), write functional Excel formulas (e.g. SUMIFS, XLOOKUP, INDEX/MATCH, AVERAGEIF, IF), answer questions about specific rows/cells, or recommend pivot tables and charts.
+- If this is a PDF: explain clauses, verify calculations, summarize specific pages, cite sections, locate terms, or extract tables.
+- If this is a JPG or PNG image: answer visual inquiries, describe objects, interpret text, explain composition, suggest color enhancements, or identify elements.
+- If code/dataset: analyze syntax, debug, compute formulas, or transform formats.
+Be clear, direct, insightful, and professional. Use formatting (tables, bullet points, formula code blocks) where helpful.`;
 
-    const formattedHistory = (history || []).map((msg: any) => ({
+    // Map history to contents format for GoogleGenAI
+    const formattedHistory: any[] = (history || []).map((msg: any) => ({
       role: msg.role === "user" ? "user" : "model",
       parts: [{ text: msg.content }],
     }));
 
+    // Attach current user message, with multimodal inlineData if available for image or PDF
+    const userParts: any[] = [];
+    
+    // Attach inlineData to ground the model on the actual file content if image or PDF
+    if (fileContext?.base64Data && (fileContext.isImage || fileContext.isPdf)) {
+      const mimeType = fileContext.isPdf 
+        ? "application/pdf" 
+        : fileContext.fileType || (fileContext.fileName?.toLowerCase().endsWith(".jpg") ? "image/jpeg" : "image/png");
+      userParts.push({
+        inlineData: {
+          mimeType,
+          data: fileContext.base64Data,
+        },
+      });
+    }
+
+    userParts.push({ text: message });
+
     formattedHistory.push({
       role: "user",
-      parts: [{ text: message }],
+      parts: userParts,
     });
 
     const response = await generateContentWithFallback(ai, {
       contents: formattedHistory,
       config: {
         systemInstruction,
-        temperature: 0.7,
-      },
+      }
     });
 
     return res.json({ 
@@ -752,7 +461,7 @@ ${fileContext.isVideo ? "Video Media File analyzed." : fileContext.content ? `Fi
     console.error("Chat Error:", error);
     return res.status(500).json({ 
       error: error.message || "Failed to process chat message",
-      details: error.stack,
+      details: error.stack 
     });
   }
 });
